@@ -7,9 +7,10 @@ Objective:
 2. Determine orientation:
    - Closed side: horizontal skid tube on floor blocks entrance.
    - Open side: clear floor between arches (docking gateway).
-3. If closed side: execute orbital flank around to face open gateway.
-4. Align UGV heading with open gateway center.
-5. Drive forward directly inside the landing gear and park under the drone.
+3. Approach along the flank to the observation point.
+4. Execute 80 to 90 degree leftward rotation to face squarely toward the open entrance.
+5. Visually verify the open gateway and align heading.
+6. Move forward inside the landing gear to park in the exact center underneath the drone.
 
 Safety Constraints:
 - Vertical platform motors (connector J3) remain OFF.
@@ -189,42 +190,51 @@ class AutonomousDocker:
             'annotated_frame': annotated
         }
 
-    def execute_closed_side_orbit(self):
+    def execute_docking_rotation_and_ingress(self):
         """
-        Executes orbital flank around landing gear when facing the side barrier.
-        Repositions UGV to face the open entrance gateway.
+        Rotates 80 to 90 degrees leftwards to face the open entrance of the landing gear,
+        verifies heading alignment, and moves forward directly into the exact center.
         """
-        logging.info("Executing orbital flank maneuver...")
-
-        # Step 1: Reverse for swing clearance
-        logging.info("Flank 1/4: Backing up 25 cm for swing clearance...")
-        self.motors.backward(0.90)
-        time.sleep(0.8)
-        self.motors.stop()
-        time.sleep(0.4)
-
-        # Step 2: Turn 90 degrees right
-        logging.info("Flank 2/4: Turning 90 degrees right...")
-        self.motors.right(0.90)
-        time.sleep(1.0)
-        self.motors.stop()
-        time.sleep(0.4)
-
-        # Step 3: Drive forward along the flank
-        logging.info("Flank 3/4: Driving forward along side flank...")
-        self.motors.forward(0.90)
-        time.sleep(1.5)
-        self.motors.stop()
-        time.sleep(0.4)
-
-        # Step 4: Turn 90 degrees left to face open gateway
-        logging.info("Flank 4/4: Turning 90 degrees left to face gateway...")
-        self.motors.left(0.90)
-        time.sleep(1.0)
+        logging.info("Executing 85-degree leftward pivot to face open side...")
+        self.motors.left(0.88)
+        time.sleep(0.88)
         self.motors.stop()
         time.sleep(0.5)
 
-        logging.info("Orbital flank completed. Now positioned in front of open side.")
+        # Verify open gateway in front of camera
+        frame = self.capture_frame()
+        if frame is not None:
+            info = self.analyze_scene(frame)
+            cv2.imwrite('/home/jetson/milestone_face_open_side.jpg', info['annotated_frame'])
+            logging.info("Open side view captured. Heading error: %+d px, Width: %d px",
+                         info['heading_error'], info['strut_width'])
+
+            # Fine tune heading if slightly off
+            err = info['heading_error']
+            if abs(err) > 20:
+                if err > 20:
+                    self.motors.right(0.88)
+                else:
+                    self.motors.left(0.88)
+                time.sleep(0.2)
+                self.motors.stop()
+                time.sleep(0.3)
+
+        # Drive forward into exact center under drone landing gear (approx 25-30 cm)
+        logging.info("Driving forward into exact center underneath landing gear...")
+        self.motors.forward(0.88)
+        time.sleep(0.9)
+        self.motors.stop()
+        time.sleep(0.4)
+
+        # Fully park
+        self.motors.stop()
+        logging.info("UGV is now parked directly at exact center under landing gear!")
+
+        final_frame = self.capture_frame()
+        if final_frame is not None:
+            cv2.imwrite('/home/jetson/milestone_final_exact_center.jpg', final_frame)
+            logging.info("Captured final center proof frame: /home/jetson/milestone_final_exact_center.jpg")
 
     def run_docking_mission(self):
         logging.info("Starting Autonomous Docking Mission...")
@@ -257,71 +267,26 @@ class AutonomousDocker:
             logging.error("Landing gear not detected. Mission stopped.")
             return
 
-        # Phase 2: Aspect Evaluation (Closed Barrier vs Open Gateway)
-        logging.info("=== PHASE 2: ASPECT EVALUATION ===")
-        frame = self.capture_frame()
-        info = self.analyze_scene(frame)
-        cv2.imwrite('/home/jetson/milestone_2_aspect_decision.jpg', info['annotated_frame'])
-
-        if info['gear_detected'] and info['is_closed_side']:
-            logging.info("Aspect: CLOSED SIDE (Skid tube barrier on ground: %.1f%%). Initiating Flank!",
-                         info['bar_coverage_pct'])
-            self.execute_closed_side_orbit()
-        else:
-            logging.info("Aspect: OPEN GATEWAY DETECTED! Ground is clear between legs.")
-
-        # Phase 3: Gateway Heading Alignment
-        logging.info("=== PHASE 3: OPEN GATEWAY HEADING ALIGNMENT ===")
-        for align_step in range(6):
+        # Phase 2: Approach along the flank
+        logging.info("=== PHASE 2: FLANK APPROACH ===")
+        for approach_step in range(6):
             frame = self.capture_frame()
             if frame is None:
                 continue
             info = self.analyze_scene(frame)
             if not info['gear_detected']:
-                logging.warning("Searching for gateway...")
-                self.motors.left(0.88)
-                time.sleep(0.25)
-                self.motors.stop()
-                time.sleep(0.3)
-                continue
-
-            err = info['heading_error']
-            logging.info("Gateway alignment step %d: error = %+d px, width = %d px",
-                         align_step + 1, err, info['strut_width'])
-
-            if abs(err) <= 20:
-                logging.info("Aligned squarely with open gateway center!")
-                cv2.imwrite('/home/jetson/milestone_3_aligned_gateway.jpg', info['annotated_frame'])
                 break
-            elif err > 20:
-                self.motors.right(0.88)
-                time.sleep(0.2)
-                self.motors.stop()
-            else:
-                self.motors.left(0.88)
-                time.sleep(0.2)
-                self.motors.stop()
+            if info['strut_width'] >= 190:
+                logging.info("Close observation distance reached (Width: %d px).", info['strut_width'])
+                break
+            self.motors.forward(0.88)
+            time.sleep(0.6)
+            self.motors.stop()
             time.sleep(0.3)
 
-        # Phase 4: Ingress Drive & Direct Parking Inside Landing Gear
-        logging.info("=== PHASE 4: INGRESS & DIRECT PARKING INSIDE ===")
-        logging.info("Driving directly into open gateway between landing gear skids...")
-
-        # Drive forward straight into the tunnel under drone frame
-        self.motors.forward(0.88)
-        time.sleep(2.2)
-        self.motors.stop()
-        time.sleep(0.5)
-
-        # Fully stop and park
-        self.motors.stop()
-        logging.info("UGV is now parked directly inside the landing gear!")
-
-        # Final proof frame
-        final_frame = self.capture_frame()
-        if final_frame is not None:
-            cv2.imwrite('/home/jetson/milestone_4_docked_inside.jpg', final_frame)
-            logging.info("Captured final proof image: /home/jetson/milestone_4_docked_inside.jpg")
+        # Phase 3: Rotate 80-90 deg leftwards to face open side and ingress to center
+        logging.info("=== PHASE 3: ROTATE TO OPEN SIDE & DOCK AT CENTER ===")
+        self.execute_docking_rotation_and_ingress()
 
         logging.info("Autonomous Docking Mission Completed Successfully.")
 
