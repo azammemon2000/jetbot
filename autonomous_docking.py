@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Autonomous UGV Docking and Charging Navigation System for NVIDIA Jetson Nano.
-Directly interfaces with CSI CAM0 via hardware-accelerated GStreamer and PCA9685 I2C motor driver.
+Directly interfaces with CSI CAM0 via hardware-accelerated GStreamer pipe and corrected PCA9685 Robot driver.
 
 Mission Capabilities:
-1. 360-degree panoramic search to locate landing gear within 5+ ft range.
+1. Panoramic search to locate landing gear within 5+ ft range.
 2. Closed-loop visual approach toward target.
 3. Aspect Classification: Detects horizontal ground shaft to determine Closed vs Open side.
 4. Orbital Flank Maneuver: If closed side is detected, orbits around the barrier to face the open side.
@@ -18,10 +18,8 @@ import time
 import os
 import sys
 import logging
-try:
-    from jetbot import Robot
-except ImportError:
-    from jetbot_motors import JetbotMotors as Robot
+import subprocess
+from jetbot import Robot
 
 # Configure Logging
 LOG_FILE = "/home/jetson/autonomous_docking.log"
@@ -34,49 +32,59 @@ logging.basicConfig(
     ]
 )
 
-def gstreamer_pipeline(
-    capture_width=1280,
-    capture_height=720,
-    display_width=640,
-    display_height=360,
-    framerate=30,
-    flip_method=2
-):
-    return (
-        "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM), "
-        "width=(int)%d, height=(int)%d, "
-        "framerate=(fraction)%d/1 ! "
-        "nvvidconv flip-method=%d ! "
-        "video/x-raw, width=(int)%d, height=(int)%d, format=(string)BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=(string)BGR ! appsink"
-        % (
-            capture_width,
-            capture_height,
-            framerate,
-            flip_method,
-            display_width,
-            display_height,
-        )
-    )
+# Calibrated motor speeds for floor/carpet rolling friction (user verified >= 0.75 needed)
+BASE_SPEED = 0.85
+MIN_MOTOR_SPEED = 0.80
+MAX_MOTOR_SPEED = 0.98
+ROTATION_SPEED = 0.86
+
+class GstCamera:
+    """
+    Subprocess GStreamer raw pipe reader.
+    Streams 30 FPS BGR frames directly without relying on OpenCV GStreamer plugin.
+    """
+    def __init__(self, width=640, height=360, fps=30):
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        gst_cmd = [
+            'gst-launch-1.0', '-q',
+            'nvarguscamerasrc', 'sensor-id=0', '!',
+            f'video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate={fps}/1', '!',
+            'nvvidconv', 'flip-method=2', '!',
+            f'video/x-raw, width={width}, height={height}, format=BGRx', '!',
+            'videoconvert', '!',
+            'video/x-raw, format=BGR', '!',
+            'fdsink', 'fd=1'
+        ]
+        self.proc = subprocess.Popen(gst_cmd, stdout=subprocess.PIPE, bufsize=self.frame_size * 2)
+
+        # Flush initial camera frames for auto-exposure stabilization
+        for _ in range(10):
+            self.read()
+
+    def read(self):
+        raw = self.proc.stdout.read(self.frame_size)
+        if len(raw) == self.frame_size:
+            return True, np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return False, None
+
+    def release(self):
+        if hasattr(self, 'proc') and self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            self.proc = None
 
 class AutonomousDocker:
     def __init__(self):
         logging.info("Initializing Autonomous UGV Docking System...")
         self.motors = Robot()
-        self.pipeline = gstreamer_pipeline()
-        self.cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
-
-        if not self.cap.isOpened():
-            logging.error("FATAL: Failed to open GStreamer camera pipeline on CAM0!")
-            raise RuntimeError("Camera failed to open")
-
-        # Let auto-exposure and white balance stabilize
-        for _ in range(10):
-            self.cap.read()
-            time.sleep(0.03)
-
+        # Strictly ensure vertical platform motors remain OFF and released
+        self.motors.vertical_motors_stop()
+        self.cap = GstCamera(width=640, height=360, fps=30)
         logging.info("Camera and motor subsystems initialized successfully.")
 
     def capture_frame(self):
@@ -88,122 +96,103 @@ class AutonomousDocker:
 
     def analyze_scene(self, frame):
         """
-        Analyzes frame to:
-        1. Find presence of landing gear structure.
+        Analyzes scene to:
+        1. Locate the black landing gear arches in the driving corridor.
         2. Extract left and right strut centroids.
-        3. Detect presence of horizontal ground shaft (Closed vs Open side).
+        3. Check ground region between strut feet for continuous horizontal barrier shaft.
         """
         h, w, _ = frame.shape
-        center_x = w // 2
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Region 1: Ground level zone for horizontal shaft detection
-        y_ground_top = int(h * 0.65)
-        y_ground_bottom = int(h * 0.88)
-        ground_roi = gray[y_ground_top:y_ground_bottom, :]
+        # Corridor of interest: x from 140 to 500, y from 90 to 255
+        corridor_x1 = 120
+        corridor_x2 = 520
+        corridor_y1 = 80
+        corridor_y2 = 250
 
-        blur_ground = cv2.GaussianBlur(ground_roi, (5, 5), 0)
-        _, thresh_ground = cv2.threshold(blur_ground, 90, 255, cv2.THRESH_BINARY_INV)
+        corridor_gray = gray[corridor_y1:corridor_y2, corridor_x1:corridor_x2]
 
-        # Horizontal kernel to detect horizontal ground shaft
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
-        h_features = cv2.morphologyEx(thresh_ground, cv2.MORPH_OPEN, h_kernel)
+        # Dark threshold: black landing gear on lighter floor
+        dark = (corridor_gray < 75).astype(np.uint8) * 255
 
-        # Region 2: Vertical strut detection zone (from mid height to ground)
-        y_strut_top = int(h * 0.35)
-        y_strut_bottom = int(h * 0.80)
-        strut_roi = gray[y_strut_top:y_strut_bottom, :]
+        # Vertical projection across upper arches (y from 10 to 90 inside corridor)
+        vert_proj = np.sum(dark[10:95, :] > 0, axis=0)
+        vert_smooth = np.convolve(vert_proj, np.ones(11)/11.0, mode='same')
 
-        blur_strut = cv2.GaussianBlur(strut_roi, (5, 5), 0)
-        thresh_strut = cv2.adaptiveThreshold(
-            blur_strut, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
-        )
-
-        # Vertical projection across columns to locate struts
-        col_sum = np.sum(thresh_strut, axis=0) / 255.0
-        kernel_smooth = np.ones(15) / 15.0
-        smoothed = np.convolve(col_sum, kernel_smooth, mode='same')
-
-        # Find significant peaks
         peaks = []
-        for i in range(int(w * 0.15), int(w * 0.85)):
-            if smoothed[i] > 18 and smoothed[i] == max(smoothed[max(0, i-25):min(w, i+26)]):
-                peaks.append((i, smoothed[i]))
+        thresh = np.max(vert_smooth) * 0.40 if np.max(vert_smooth) > 0 else 100
+        for x in range(12, len(vert_smooth) - 12):
+            if vert_smooth[x] > thresh and vert_smooth[x] == np.max(vert_smooth[max(0, x-14):min(len(vert_smooth), x+15)]):
+                peaks.append(x + corridor_x1)
 
-        # Sort peaks by horizontal coordinate
-        peaks.sort(key=lambda p: p[0])
-
-        gear_detected = len(peaks) >= 2
+        gear_detected = False
         left_strut_x = None
         right_strut_x = None
-        tunnel_mid_x = None
+        tunnel_mid_x = w // 2
         strut_width = 0
-        heading_error = 0
+        is_closed_side = False
+        bar_coverage_pct = 0.0
 
-        if gear_detected:
-            # Outer two prominent peaks define the bounds
-            left_strut_x = peaks[0][0]
-            right_strut_x = peaks[-1][0]
-            tunnel_mid_x = (left_strut_x + right_strut_x) // 2
-            strut_width = right_strut_x - left_strut_x
-            heading_error = tunnel_mid_x - center_x
+        if len(peaks) >= 2:
+            # Pair closest to center with realistic width
+            valid_pairs = []
+            for i in range(len(peaks)):
+                for j in range(i+1, len(peaks)):
+                    pw = peaks[j] - peaks[i]
+                    if 60 <= pw <= 380:
+                        mid = (peaks[i] + peaks[j]) // 2
+                        center_dist = abs(mid - (w // 2))
+                        valid_pairs.append((peaks[i], peaks[j], pw, mid, center_dist))
 
-        # Ground shaft coverage analysis between strut span
-        if gear_detected and strut_width > 40:
-            span_x1 = max(0, left_strut_x + int(strut_width * 0.15))
-            span_x2 = min(w, right_strut_x - int(strut_width * 0.15))
-            if span_x2 > span_x1:
-                span_h = h_features[:, span_x1:span_x2]
-                col_has_bar = np.any(span_h > 0, axis=0)
-                bar_coverage_pct = (np.sum(col_has_bar) / float(span_x2 - span_x1)) * 100.0
-            else:
-                bar_coverage_pct = 0.0
-        else:
-            bar_coverage_pct = 0.0
+            if valid_pairs:
+                # Select pair closest to visual centerline
+                best = min(valid_pairs, key=lambda p: p[4])
+                left_strut_x = best[0]
+                right_strut_x = best[1]
+                strut_width = best[2]
+                tunnel_mid_x = best[3]
+                gear_detected = True
 
-        is_closed_side = bar_coverage_pct > 50.0
+                # Check horizontal ground barrier between left and right strut feet (y from 210 to 240)
+                ground_band = dark[120:165, (left_strut_x - corridor_x1):(right_strut_x - corridor_x1)]
+                if ground_band.size > 0:
+                    row_cov = np.mean(ground_band > 0, axis=1)
+                    bar_coverage_pct = float(np.max(row_cov) * 100.0)
 
-        # Create annotated diagnostic frame
+                    # Continuous black tube across ground means CLOSED barrier side
+                    if bar_coverage_pct > 30.0:
+                        is_closed_side = True
+
         annotated = frame.copy()
         if gear_detected:
-            # Draw strut lines (green)
             cv2.line(annotated, (left_strut_x, 0), (left_strut_x, h), (0, 255, 0), 2)
             cv2.line(annotated, (right_strut_x, 0), (right_strut_x, h), (0, 255, 0), 2)
+            cv2.line(annotated, (tunnel_mid_x, 0), (tunnel_mid_x, h), (255, 0, 0), 2)
+            cv2.line(annotated, (w//2, 0), (w//2, h), (0, 0, 255), 1)
 
-            # Draw tunnel target center (cyan)
-            cv2.line(annotated, (tunnel_mid_x, 0), (tunnel_mid_x, h), (255, 255, 0), 2)
-
-            # Draw camera center (red)
-            cv2.line(annotated, (center_x, 0), (center_x, h), (0, 0, 255), 2)
-
-            aspect_text = "CLOSED SIDE (BARRIER %.0f%%)" % bar_coverage_pct if is_closed_side else "OPEN SIDE (CLEAR %.0f%%)" % bar_coverage_pct
-            status_color = (0, 0, 255) if is_closed_side else (0, 255, 0)
-            cv2.putText(annotated, aspect_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
-            cv2.putText(annotated, "Err: %+d px | Width: %d px" % (heading_error, strut_width), 
-                        (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            label = "ASPECT: CLOSED (BARRIER PRESENT)" if is_closed_side else "ASPECT: OPEN (GATEWAY)"
+            color = (0, 0, 255) if is_closed_side else (0, 255, 0)
+            cv2.putText(annotated, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(annotated, f"Strut Width: {strut_width}px | Shaft Cov: {bar_coverage_pct:.1f}%",
+                        (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         else:
-            cv2.putText(annotated, "SEARCHING: NO LANDING GEAR IN FOV", (20, 35), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
+            cv2.putText(annotated, "SEARCHING FOR LANDING GEAR...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         return {
             "gear_detected": gear_detected,
             "left_strut_x": left_strut_x,
             "right_strut_x": right_strut_x,
             "tunnel_mid_x": tunnel_mid_x,
+            "heading_error": tunnel_mid_x - (w // 2),
             "strut_width": strut_width,
-            "heading_error": heading_error,
             "is_closed_side": is_closed_side,
             "bar_coverage_pct": bar_coverage_pct,
             "annotated_frame": annotated
         }
 
     def execute_search_sweep(self):
-        """
-        Rotates incrementally in place to scan 360 degrees for landing gear.
-        """
         logging.info("[STATE 0: SEARCH] Initiating 360-degree scan sweep...")
-        for step in range(12): # 12 increments of ~30 degrees
+        for step in range(12):
             frame = self.capture_frame()
             info = self.analyze_scene(frame)
             if info["gear_detected"]:
@@ -211,25 +200,17 @@ class AutonomousDocker:
                 cv2.imwrite("/home/jetson/milestone_0_acquired.jpg", info["annotated_frame"])
                 return True
 
-            # Incremental pulse turn
             logging.info("[STATE 0: SEARCH] Scanning... pulse rotating (step %d/12)", step+1)
-            self.motors.set_motors(0.25, -0.25)
-            time.sleep(0.18)
-            self.motors.stop()
+            self.motors.right(ROTATION_SPEED, duration=0.15)
             time.sleep(0.35)
 
         logging.warning("[STATE 0: SEARCH] Full 360 sweep completed. Target not acquired.")
         return False
 
     def execute_approach(self):
-        """
-        Drives toward target landing gear until close enough to verify barrier aspect.
-        Target approach distance: strut width approx 180-220 pixels.
-        """
-        logging.info("[STATE 1: APPROACH] Beginning closed-loop approach...")
+        logging.info("[STATE 1: APPROACH] Beginning closed-loop approach toward landing gear...")
         start_time = time.time()
-        kp = 0.0018
-        base_speed = 0.22
+        kp = 0.0010
 
         while time.time() - start_time < 12.0:
             frame = self.capture_frame()
@@ -244,58 +225,46 @@ class AutonomousDocker:
             error = info["heading_error"]
             width = info["strut_width"]
 
-            # Check if close enough for definitive aspect check
-            if width >= 190:
+            # Close inspection distance reached (approx 1.5 ft / 180 px)
+            if width >= 170:
                 logging.info("[STATE 1: APPROACH] Close inspection distance reached (Width: %d px). Stopping.", width)
                 self.motors.stop()
                 cv2.imwrite("/home/jetson/milestone_1_approached.jpg", info["annotated_frame"])
                 return info
 
-            # Differential steering P-controller
+            # Differential steering P-controller with ground speed thresholds
             steer = kp * error
-            left_v = max(0.12, min(0.35, base_speed + steer))
-            right_v = max(0.12, min(0.35, base_speed - steer))
+            left_v = max(MIN_MOTOR_SPEED, min(MAX_MOTOR_SPEED, BASE_SPEED + steer))
+            right_v = max(MIN_MOTOR_SPEED, min(MAX_MOTOR_SPEED, BASE_SPEED - steer))
 
             self.motors.set_motors(left_v, right_v)
-            time.sleep(0.05)
+            time.sleep(0.08)
 
         self.motors.stop()
         logging.info("[STATE 1: APPROACH] Approach timeout reached.")
         return self.analyze_scene(self.capture_frame())
 
     def execute_orbital_flank(self):
-        """
-        Executes a 90-degree orbital flank around the landing gear to navigate from
-        a Closed Side (ground barrier) to an Open Side (open arch tunnel).
-        """
-        logging.info("[STATE 2: ORBITAL FLANK] Barrier detected! Executing 90-deg orbit around landing gear...")
+        logging.info("[STATE 2: ORBITAL FLANK] Barrier detected! Executing orbit around landing gear...")
 
         # Step 1: Back up slightly for turning clearance
         logging.info("[STATE 2: ORBITAL FLANK] Backing up 20 cm for clearance...")
-        self.motors.backward(0.24)
-        time.sleep(0.8)
-        self.motors.stop()
+        self.motors.backward(BASE_SPEED, duration=0.35)
         time.sleep(0.2)
 
-        # Step 2: Rotate 90 degrees right (tangent to landing gear)
+        # Step 2: Rotate 90 degrees right
         logging.info("[STATE 2: ORBITAL FLANK] Turning 90 degrees right...")
-        self.motors.set_motors(0.30, -0.30)
-        time.sleep(0.55)
-        self.motors.stop()
+        self.motors.right(ROTATION_SPEED, duration=0.45)
         time.sleep(0.2)
 
-        # Step 3: Drive forward along the flank (length of landing gear ~40 cm)
+        # Step 3: Drive forward along the flank
         logging.info("[STATE 2: ORBITAL FLANK] Driving forward along flank...")
-        self.motors.forward(0.25)
-        time.sleep(1.4)
-        self.motors.stop()
+        self.motors.forward(BASE_SPEED, duration=0.75)
         time.sleep(0.2)
 
         # Step 4: Turn 90 degrees left back toward landing gear center
-        logging.info("[STATE 2: ORBITAL FLANK] Turning 90 degrees left to face open side...")
-        self.motors.set_motors(-0.30, 0.30)
-        time.sleep(0.55)
-        self.motors.stop()
+        logging.info("[STATE 2: ORBITAL FLANK] Turning 90 degrees left to face open gateway...")
+        self.motors.left(ROTATION_SPEED, duration=0.45)
         time.sleep(0.4)
 
         # Re-evaluate aspect
@@ -307,22 +276,16 @@ class AutonomousDocker:
         return info
 
     def execute_tunnel_ingress(self):
-        """
-        Aligns dead-center with the open arch tunnel and slides smoothly under the drone belly.
-        Stops when concentric with landing gear center (strut width >= 420 px).
-        """
         logging.info("[STATE 3: PRECISION INGRESS] Commencing tunnel visual servoing and ingress...")
-        kp_align = 0.0022
-        v_ingress = 0.20
-        target_docking_width = 400 # Calibrated width when UGV coil is centered under belly
+        kp_align = 0.0012
+        target_docking_width = 320
 
         start_time = time.time()
-        while time.time() - start_time < 15.0:
+        while time.time() - start_time < 10.0:
             frame = self.capture_frame()
             info = self.analyze_scene(frame)
 
             if not info["gear_detected"]:
-                # When very close, struts move off screen edges as robot is already inside!
                 logging.info("[STATE 4: DOCKED] Struts passed peripheral boundaries. UGV is fully underneath!")
                 break
 
@@ -333,15 +296,13 @@ class AutonomousDocker:
                 logging.info("[STATE 4: DOCKED] Target docking width reached (%d px >= %d px)!", width, target_docking_width)
                 break
 
-            # Precision steering
             steer = kp_align * error
-            left_v = max(0.12, min(0.30, v_ingress + steer))
-            right_v = max(0.12, min(0.30, v_ingress - steer))
+            left_v = max(MIN_MOTOR_SPEED, min(MAX_MOTOR_SPEED, BASE_SPEED + steer))
+            right_v = max(MIN_MOTOR_SPEED, min(MAX_MOTOR_SPEED, BASE_SPEED - steer))
 
             self.motors.set_motors(left_v, right_v)
-            time.sleep(0.04)
+            time.sleep(0.06)
 
-        # Apply electronic brake
         self.motors.stop()
         time.sleep(0.1)
 
@@ -355,18 +316,15 @@ class AutonomousDocker:
         return True
 
     def run_mission(self):
-        """
-        Executes end-to-end autonomous mission.
-        """
-        logging.info("### STARTING AUTONOMOUS MISSION ###")
+        logging.info("### STARTING AUTONOMOUS DOCKING MISSION ###")
 
         # 1. Capture initial view
         frame = self.capture_frame()
         info = self.analyze_scene(frame)
 
-        # 2. Check if landing gear is in view or if 360 search is needed
+        # 2. Check if landing gear is in view or if search is needed
         if not info["gear_detected"]:
-            logging.info("Landing gear not in initial FOV. Initiating 360 search...")
+            logging.info("Landing gear not in initial FOV. Initiating scan...")
             found = self.execute_search_sweep()
             if not found:
                 logging.error("Mission Aborted: Unable to find landing gear within range.")
@@ -391,12 +349,8 @@ class AutonomousDocker:
     def cleanup(self):
         logging.info("Cleaning up resources...")
         self.motors.stop()
-        self.motors.close()
         self.cap.release()
         logging.info("Shutdown completed cleanly.")
-
-    def close(self):
-        self.cleanup()
 
 if __name__ == '__main__':
     import argparse
