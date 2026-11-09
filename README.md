@@ -14,13 +14,13 @@ Standard Jetbot libraries assume an Adafruit TB6612 motor shield at address `0x6
 * Battery Telemetry ADC: Address `0x1b`
 
 ### Actuator Channel Assignments
-* **Left Wheel Motor (J1)**:
-  * Forward PWM: PCA9685 Channel 8 (`IN1A`)
-  * Reverse PWM: PCA9685 Channel 9 (`IN1B`)
+* **Left Wheel Motor**:
+  * Forward PWM: PCA9685 Channel 11 (`INA`)
+  * Reverse PWM: PCA9685 Channel 10 (`INB`)
   * Power: 12V Battery Rail (`VM`)
-* **Right Wheel Motor (J2)**:
-  * Forward PWM: PCA9685 Channel 11 (`IN2B`)
-  * Reverse PWM: PCA9685 Channel 10 (`IN2A`)
+* **Right Wheel Motor**:
+  * Forward PWM: PCA9685 Channel 8 (`INA`)
+  * Reverse PWM: PCA9685 Channel 9 (`INB`)
   * Power: 12V Battery Rail (`VM`)
 * **Vertical Platform Scissor Lift (J3)**:
   * Up PWM: PCA9685 Channel 12 (`IN3A`)

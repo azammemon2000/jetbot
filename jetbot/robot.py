@@ -27,10 +27,10 @@ class Robot(SingletonConfigurable):
         self.pwm = PWM(self.i2c_addr, i2c_bus=self.i2c_bus)
         self.pwm.setPWMFreq(1600)
 
-        # Left motor: Channel 8 (INA) and 9 (INB)
-        self.left_motor = AM2857Motor(self.pwm, pin_a=8, pin_b=9, alpha=self.left_motor_alpha)
-        # Right motor: Channel 11 (INA) and 10 (INB) - inverted for forward translation
-        self.right_motor = AM2857Motor(self.pwm, pin_a=11, pin_b=10, alpha=self.right_motor_alpha)
+        # Left motor: Channel 11 (INA) and 10 (INB)
+        self.left_motor = AM2857Motor(self.pwm, pin_a=11, pin_b=10, alpha=self.left_motor_alpha)
+        # Right motor: Channel 8 (INA) and 9 (INB)
+        self.right_motor = AM2857Motor(self.pwm, pin_a=8, pin_b=9, alpha=self.right_motor_alpha)
 
         # Clear vertical lift motor channels (12 and 13)
         self.vertical_motors_stop()
