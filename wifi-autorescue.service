@@ -1,0 +1,14 @@
+[Unit]
+Description=WiFi Auto-Rescue and Power-Save Watchdog for GreenBots
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wifi_autorescue.sh
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
