@@ -2,22 +2,28 @@
 """
 Autonomous Drone Landing Gear Docking System for Jetbot UGV.
 
-Objective:
-1. Detect drone landing gear while rejecting background furniture (office chairs, desks).
-2. Determine orientation:
-   - Closed side: horizontal skid tube on floor blocks entrance.
+Trigonometric Orbital Waypoint & Visual Docking:
+1. 360-degree sweep search: Rotates 30 degrees clockwise up to 12 steps until landing gear is located.
+2. Distance-based approach: Closes in if far so it can reliably inspect the aspect.
+3. Aspect Classification:
+   - Closed side: horizontal skid tube on ground blocks entry.
    - Open side: clear floor between arches (docking gateway).
-3. Approach along the flank to the observation point.
-4. Execute 80 to 90 degree leftward rotation to face squarely toward the open entrance.
-5. Visually verify the open gateway and align heading.
-6. Move forward inside the landing gear to park in the exact center underneath the drone.
+4. Trigonometric Flank (Pythagoras Theorem):
+   - Given perpendicular distance d and standoff base b (2.5 ft),
+   - Computes hypotenuse h = sqrt(d^2 + b^2) and heading angle theta = atan(b / d).
+   - Turns by theta, drives distance h along hypotenuse to the open-side waypoint.
+   - Rotates back to acquire the open gateway in camera view.
+5. Visual Servoing Alignment & Final Ingress:
+   - Fine-tunes heading to center the open entrance (heading error < 15 px).
+   - Drives forward 2.0-2.5 ft straight between the landing gear shafts to park underneath.
 
 Safety Constraints:
-- Vertical platform motors (connector J3) remain OFF.
-- Speeds >= 0.85 to overcome carpet/tile friction reliably.
+- Vertical platform motors (connector J3) remain OFF at all times.
+- Motor speeds calibrated >= 0.85 to overcome carpet/tile friction reliably.
 """
 
 import time
+import math
 import sys
 import subprocess
 import logging
@@ -33,6 +39,11 @@ logging.basicConfig(
         logging.FileHandler('/home/jetson/autonomous_docking.log', mode='w')
     ]
 )
+
+# Calibrated robot physical constants at speed 0.88
+ANGULAR_SPEED_DEG_PER_SEC = 95.0 # Degrees per second rotation on tracks
+LINEAR_SPEED_FT_PER_SEC = 1.20   # Feet per second forward drive (~36 cm/s)
+CALIB_K_FT_PX = 380.0            # Distance calibration constant (d_ft = K / width_px)
 
 class GstCamera:
     """Raw GStreamer BGR pipe capture directly from CSI camera sensor."""
@@ -54,7 +65,7 @@ class GstCamera:
         logging.info("Starting GStreamer camera pipeline subprocess...")
         self.proc = subprocess.Popen(gst_cmd, stdout=subprocess.PIPE, bufsize=self.frame_size * 2)
 
-        # Warm up exposure and discard initial frames
+        # Warm up exposure and discard initial settling frames
         for _ in range(5):
             self.read()
 
@@ -81,7 +92,7 @@ class AutonomousDocker:
         # Strictly ensure vertical platform motors remain OFF and released
         self.motors.vertical_motors_stop()
         self.cap = GstCamera(width=640, height=360, fps=30)
-        logging.info("Subsystems initialized. Speeds calibrated >= 0.88.")
+        logging.info("Subsystems initialized. Platform motors locked OFF.")
 
     def capture_frame(self):
         ret, frame = self.cap.read()
@@ -95,7 +106,7 @@ class AutonomousDocker:
         Analyzes scene to:
         1. Reject office chairs and tall furniture (columns with tall backrests in top 70px).
         2. Detect the two legs/arches of the drone landing gear resting on the floor.
-        3. Determine if the ground between the legs has a barrier tube (closed side) or is clear (open gateway).
+        3. Check ground barrier tube to distinguish closed side from open gateway.
         """
         h, w, _ = frame.shape
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -138,7 +149,6 @@ class AutonomousDocker:
                     ground_strip = drone_band[125:170, x1:x2]
                     ground_cov = np.mean(np.max(ground_strip > 0, axis=0)) if ground_strip.size > 0 else 0
 
-                    # Score combines prominent legs and top bridge connectivity
                     score = (peaks[i][1] + peaks[j][1]) * (0.3 + top_cov)
                     if score > best_score:
                         best_score = score
@@ -168,12 +178,16 @@ class AutonomousDocker:
             cv2.line(annotated, (tunnel_mid_x, 0), (tunnel_mid_x, h), (255, 0, 0), 2)
             cv2.line(annotated, (w//2, 0), (w//2, h), (0, 0, 255), 1)
 
+            # Estimate distance in feet using calibrated focal constant
+            est_dist_ft = CALIB_K_FT_PX / float(strut_width) if strut_width > 0 else 0.0
+
             label = "ASPECT: CLOSED (BARRIER PRESENT)" if is_closed_side else "ASPECT: OPEN (GATEWAY)"
             col = (0, 0, 255) if is_closed_side else (0, 255, 0)
             cv2.putText(annotated, label, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
-            info_txt = "Width: %dpx | Ground Cov: %.1f%%" % (strut_width, bar_coverage_pct)
+            info_txt = "Dist: %.2fft | Width: %dpx | Ground Cov: %.1f%%" % (est_dist_ft, strut_width, bar_coverage_pct)
             cv2.putText(annotated, info_txt, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         else:
+            est_dist_ft = 0.0
             cv2.putText(annotated, "SEARCHING FOR DRONE LANDING GEAR...", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         heading_error = tunnel_mid_x - (w // 2)
@@ -184,111 +198,239 @@ class AutonomousDocker:
             'right_strut_x': right_strut_x,
             'tunnel_mid_x': tunnel_mid_x,
             'strut_width': strut_width,
+            'est_dist_ft': est_dist_ft,
             'is_closed_side': is_closed_side,
             'bar_coverage_pct': bar_coverage_pct,
             'heading_error': heading_error,
             'annotated_frame': annotated
         }
 
-    def execute_docking_rotation_and_ingress(self):
+    def search_360_sweep(self):
         """
-        Rotates 80 to 90 degrees leftwards to face the open entrance of the landing gear,
-        verifies heading alignment, and moves forward directly into the exact center.
+        Rotates 30 degrees clockwise up to 12 steps (360 degrees)
+        until the drone landing gear is acquired by the camera.
         """
-        logging.info("Executing 85-degree leftward pivot to face open side...")
-        self.motors.left(0.88)
-        time.sleep(0.88)
-        self.motors.stop()
-        time.sleep(0.5)
-
-        # Verify open gateway in front of camera
-        frame = self.capture_frame()
-        if frame is not None:
-            info = self.analyze_scene(frame)
-            cv2.imwrite('/home/jetson/milestone_face_open_side.jpg', info['annotated_frame'])
-            logging.info("Open side view captured. Heading error: %+d px, Width: %d px",
-                         info['heading_error'], info['strut_width'])
-
-            # Fine tune heading if slightly off
-            err = info['heading_error']
-            if abs(err) > 20:
-                if err > 20:
-                    self.motors.right(0.88)
-                else:
-                    self.motors.left(0.88)
-                time.sleep(0.2)
-                self.motors.stop()
-                time.sleep(0.3)
-
-        # Drive forward into exact center under drone landing gear (approx 25-30 cm)
-        logging.info("Driving forward into exact center underneath landing gear...")
-        self.motors.forward(0.88)
-        time.sleep(0.9)
-        self.motors.stop()
-        time.sleep(0.4)
-
-        # Fully park
-        self.motors.stop()
-        logging.info("UGV is now parked directly at exact center under landing gear!")
-
-        final_frame = self.capture_frame()
-        if final_frame is not None:
-            cv2.imwrite('/home/jetson/milestone_final_exact_center.jpg', final_frame)
-            logging.info("Captured final center proof frame: /home/jetson/milestone_final_exact_center.jpg")
-
-    def run_docking_mission(self):
-        logging.info("Starting Autonomous Docking Mission...")
-
-        # Safety check: keep vertical lift inactive
-        self.motors.vertical_motors_stop()
-
-        # Phase 1: Scene Detection & Initial Centering
-        logging.info("=== PHASE 1: INITIAL DETECTION & CENTERING ===")
-        detected = False
-        for attempt in range(8):
+        logging.info("Starting 360-degree sweep search for landing gear...")
+        for step in range(12):
             frame = self.capture_frame()
-            if frame is None:
-                continue
-            info = self.analyze_scene(frame)
-            if info['gear_detected']:
-                cv2.imwrite('/home/jetson/milestone_1_initial_detection.jpg', info['annotated_frame'])
-                logging.info("Landing gear located! Width: %d px, Heading error: %+d px",
-                             info['strut_width'], info['heading_error'])
-                detected = True
-                break
-            else:
-                logging.info("Searching... sweep turn right (attempt %d)...", attempt + 1)
-                self.motors.right(0.88)
-                time.sleep(0.3)
-                self.motors.stop()
-                time.sleep(0.4)
+            if frame is not None:
+                info = self.analyze_scene(frame)
+                if info['gear_detected']:
+                    logging.info("Landing gear located on sweep step %d! (Width: %d px, Dist: %.2f ft)",
+                                 step + 1, info['strut_width'], info['est_dist_ft'])
+                    cv2.imwrite('/home/jetson/milestone_1_search_acquired.jpg', info['annotated_frame'])
+                    return True, info
 
-        if not detected:
-            logging.error("Landing gear not detected. Mission stopped.")
-            return
+            # Rotate 30 degrees clockwise
+            logging.info("Sweep step %d/12: Rotating 30 degrees clockwise...", step + 1)
+            duration_30deg = 30.0 / ANGULAR_SPEED_DEG_PER_SEC
+            self.motors.right(0.88)
+            time.sleep(duration_30deg)
+            self.motors.stop()
+            time.sleep(0.4)
 
-        # Phase 2: Approach along the flank
-        logging.info("=== PHASE 2: FLANK APPROACH ===")
-        for approach_step in range(6):
+        logging.warning("Full 360-degree sweep completed without detecting landing gear.")
+        return False, None
+
+    def approach_to_inspection_distance(self):
+        """
+        Aligns heading and drives forward if the landing gear is far,
+        so it reaches a close inspection distance (~2.0 ft, width >= 180 px)
+        to reliably distinguish open side vs closed side.
+        """
+        logging.info("Aligning heading and approaching to inspection distance...")
+        for step in range(8):
             frame = self.capture_frame()
             if frame is None:
                 continue
             info = self.analyze_scene(frame)
             if not info['gear_detected']:
+                logging.warning("Lost sight of landing gear during approach.")
                 break
-            if info['strut_width'] >= 190:
-                logging.info("Close observation distance reached (Width: %d px).", info['strut_width'])
-                break
+
+            err = info['heading_error']
+            dist = info['est_dist_ft']
+            width = info['strut_width']
+            logging.info("Approach step %d: Dist = %.2f ft, Width = %d px, Heading error = %+d px",
+                         step + 1, dist, width, err)
+
+            # Center heading
+            if abs(err) > 20:
+                if err > 20:
+                    self.motors.right(0.88)
+                else:
+                    self.motors.left(0.88)
+                time.sleep(0.18)
+                self.motors.stop()
+                time.sleep(0.2)
+                continue
+
+            # Check if close enough (strut width >= 180 px, approx 2.0 ft away)
+            if width >= 180:
+                logging.info("Optimal inspection distance reached (%.2f ft, %d px).", dist, width)
+                cv2.imwrite('/home/jetson/milestone_2_inspection_distance.jpg', info['annotated_frame'])
+                return info
+
+            # Drive forward pulse
             self.motors.forward(0.88)
-            time.sleep(0.6)
+            time.sleep(0.5)
             self.motors.stop()
             time.sleep(0.3)
 
-        # Phase 3: Rotate 80-90 deg leftwards to face open side and ingress to center
-        logging.info("=== PHASE 3: ROTATE TO OPEN SIDE & DOCK AT CENTER ===")
-        self.execute_docking_rotation_and_ingress()
+        frame = self.capture_frame()
+        return self.analyze_scene(frame) if frame is not None else None
 
-        logging.info("Autonomous Docking Mission Completed Successfully.")
+    def execute_trigonometric_orbit(self, d_ft, base_ft=2.5):
+        """
+        Implements Pythagoras right-triangle navigation from user diagram:
+        d = perpendicular distance to landing gear closed side
+        b = standoff base distance along open gateway axis (2.5 ft)
+        h = hypotenuse = sqrt(d^2 + b^2)
+        theta = angle = atan(b / d) in degrees
+
+        1. Turn right by theta.
+        2. Drive forward along hypotenuse h.
+        3. Turn left to face back towards open side of landing gear.
+        """
+        # Ensure d is physically bounded
+        d = max(1.5, min(d_ft, 3.5))
+        b = base_ft
+
+        h = math.sqrt(d**2 + b**2)
+        theta_rad = math.atan2(b, d)
+        theta_deg = math.degrees(theta_rad)
+
+        logging.info("=== TRIGONOMETRIC FLANK PARAMETERS ===")
+        logging.info("  Perpendicular distance (d): %.2f ft", d)
+        logging.info("  Standoff base (b): %.2f ft", b)
+        logging.info("  Hypotenuse distance (h): %.2f ft", h)
+        logging.info("  Turn angle (theta): %.1f degrees", theta_deg)
+
+        # Step 1: Turn right by theta degrees
+        turn_duration = theta_deg / ANGULAR_SPEED_DEG_PER_SEC
+        logging.info("Step 1/3: Turning right by %.1f degrees (duration: %.2f s)...", theta_deg, turn_duration)
+        self.motors.right(0.88)
+        time.sleep(turn_duration)
+        self.motors.stop()
+        time.sleep(0.4)
+
+        # Step 2: Drive forward along hypotenuse h
+        drive_duration = h / LINEAR_SPEED_FT_PER_SEC
+        logging.info("Step 2/3: Driving forward along hypotenuse %.2f ft (duration: %.2f s)...", h, drive_duration)
+        self.motors.forward(0.88)
+        time.sleep(drive_duration)
+        self.motors.stop()
+        time.sleep(0.4)
+
+        # Step 3: Turn back left towards the open side of the landing gear
+        # Theoretical turn is 90 + theta, executed in sweep pulses to acquire landing gear
+        turn_back_deg = 90.0 + theta_deg
+        logging.info("Step 3/3: Turning left by %.1f degrees to face open entrance...", turn_back_deg)
+        turn_back_duration = turn_back_deg / ANGULAR_SPEED_DEG_PER_SEC
+        self.motors.left(0.88)
+        time.sleep(turn_back_duration)
+        self.motors.stop()
+        time.sleep(0.5)
+
+        logging.info("Trigonometric waypoint reached. UGV is now in front of open side.")
+
+    def fine_tune_and_ingress(self, base_ft=2.0):
+        """
+        Reacquires the open gateway, fine-tunes heading centering,
+        and moves forward along the base line to park directly between the landing gear shafts.
+        """
+        logging.info("Fine-tuning alignment with open entrance gateway...")
+
+        # Search / fine-tune sweep to center the open gateway
+        aligned = False
+        for step in range(8):
+            frame = self.capture_frame()
+            if frame is None:
+                continue
+            info = self.analyze_scene(frame)
+            if not info['gear_detected']:
+                logging.info("Sweeping left to locate open gateway (step %d)...", step + 1)
+                self.motors.left(0.88)
+                time.sleep(0.18)
+                self.motors.stop()
+                time.sleep(0.3)
+                continue
+
+            err = info['heading_error']
+            logging.info("Alignment step %d: Heading error = %+d px, Width = %d px",
+                         step + 1, err, info['strut_width'])
+
+            if abs(err) <= 15:
+                logging.info("Squarely aligned with open entrance gateway center!")
+                cv2.imwrite('/home/jetson/milestone_3_gateway_aligned.jpg', info['annotated_frame'])
+                aligned = True
+                break
+            elif err > 15:
+                self.motors.right(0.88)
+                time.sleep(0.15)
+                self.motors.stop()
+            else:
+                self.motors.left(0.88)
+                time.sleep(0.15)
+                self.motors.stop()
+            time.sleep(0.25)
+
+        # Ingress forward drive: drive forward base_ft (approx 2.0 ft, 1.8 s)
+        ingress_duration = base_ft / LINEAR_SPEED_FT_PER_SEC
+        logging.info("Driving forward %.1f ft into open gateway (duration: %.2f s)...", base_ft, ingress_duration)
+        self.motors.forward(0.88)
+        time.sleep(ingress_duration)
+        self.motors.stop()
+        time.sleep(0.5)
+
+        # Final stop
+        self.motors.stop()
+        logging.info("UGV is now parked directly between the shafts of the landing gear!")
+
+        final_frame = self.capture_frame()
+        if final_frame is not None:
+            cv2.imwrite('/home/jetson/milestone_4_docked_between_shafts.jpg', final_frame)
+            logging.info("Captured final docked frame: /home/jetson/milestone_4_docked_between_shafts.jpg")
+
+    def run_docking_mission(self):
+        logging.info("==================================================")
+        logging.info("STARTING AUTONOMOUS DRONE DOCKING MISSION")
+        logging.info("==================================================")
+
+        # Safety check: ensure vertical lift remains inactive
+        self.motors.vertical_motors_stop()
+
+        # Step 1: 360-degree sweep search
+        found, info = self.search_360_sweep()
+        if not found:
+            logging.error("Landing gear could not be found within 360 degrees. Mission aborted.")
+            return
+
+        # Step 2: Approach to close inspection distance
+        info = self.approach_to_inspection_distance()
+        if info is None or not info['gear_detected']:
+            logging.error("Failed to establish close inspection of landing gear.")
+            return
+
+        # Step 3: Aspect Decision & Trigonometric Flank
+        logging.info("=== ASPECT EVALUATION ===")
+        is_closed = info['is_closed_side']
+        d_est = info['est_dist_ft']
+
+        if is_closed:
+            logging.info("Detected CLOSED SIDE (Skid tube barrier on floor: %.1f%%).", info['bar_coverage_pct'])
+            logging.info("Executing Pythagoras waypoint navigation to open side...")
+            self.execute_trigonometric_orbit(d_ft=d_est, base_ft=2.5)
+        else:
+            logging.info("Detected OPEN SIDE (Gateway clear: %.1f%% barrier). Already facing opening!",
+                         info['bar_coverage_pct'])
+
+        # Step 4: Fine-tune heading and move inside between shafts
+        self.fine_tune_and_ingress(base_ft=2.0)
+
+        logging.info("==================================================")
+        logging.info("AUTONOMOUS DOCKING MISSION COMPLETED SUCCESSFULLY")
+        logging.info("==================================================")
 
     def close(self):
         self.motors.stop()
